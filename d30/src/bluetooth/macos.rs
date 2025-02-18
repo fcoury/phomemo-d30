@@ -1,184 +1,177 @@
-use cocoa_foundation::{
-    base::{id, nil},
-    foundation::NSString,
-};
 use log::debug;
-use objc::runtime::Class;
-use objc::{class, msg_send, sel, sel_impl};
+use std::io::Write;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use super::BluetoothError;
 use super::BluetoothSocket;
 
-#[link(name = "IOBluetooth", kind = "framework")]
-extern "C" {}
-
 pub struct MacOSBluetoothSocket {
-    device: id,
-    channel: id,
+    device_addr: String,
 }
 
 impl BluetoothSocket for MacOSBluetoothSocket {
     fn connect(&mut self, addr: &str) -> Result<(), BluetoothError> {
-        unsafe {
-            debug!("Connecting to device with address: {}", addr);
-            let pool: id = msg_send![class!(NSAutoreleasePool), new];
+        // First ensure blueutil is installed
+        let which_output = Command::new("which")
+            .arg("blueutil")
+            .output()
+            .map_err(|_| {
+                BluetoothError::InternalError(
+                    "blueutil not found. Install it with 'brew install blueutil'".to_string(),
+                )
+            })?;
 
-            // Format MAC address for IOBluetooth
-            let addr = addr.replace(":", "-");
-            let addr_str = NSString::alloc(nil).init_str(&addr);
-            debug!("Using formatted address: {}", addr);
-
-            let device_class = match Class::get("IOBluetoothDevice") {
-                Some(class) => class,
-                None => {
-                    let _: () = msg_send![pool, release];
-                    return Err(BluetoothError::InternalError(
-                        "IOBluetooth framework not found".to_string(),
-                    ));
-                }
-            };
-
-            // Get device
-            self.device = msg_send![device_class, deviceWithAddressString:addr_str];
-            if self.device == nil {
-                let _: () = msg_send![pool, release];
-                return Err(BluetoothError::ConnectionFailed(
-                    "Device not found".to_string(),
-                ));
-            }
-
-            debug!("Got device, checking name...");
-            let name: id = msg_send![self.device, name];
-            if name != nil {
-                let name_str: id = msg_send![name, UTF8String];
-                debug!("Device name: {:?}", name_str);
-            }
-
-            // Force service discovery
-            debug!("Performing service discovery...");
-            let inquiry_result: bool = msg_send![self.device, performSDPQuery:nil];
-            debug!("SDP query result: {}", inquiry_result);
-            thread::sleep(Duration::from_millis(1000));
-
-            // Check device properties
-            let is_paired: bool = msg_send![self.device, isPaired];
-            let is_connected: bool = msg_send![self.device, isConnected];
-            debug!(
-                "Device status - Paired: {}, Connected: {}",
-                is_paired, is_connected
-            );
-
-            // Try to connect if not already connected
-            if !is_connected {
-                debug!("Attempting to connect...");
-                let connect_result: bool = msg_send![self.device, openConnection];
-                if !connect_result {
-                    let _: () = msg_send![pool, release];
-                    return Err(BluetoothError::ConnectionFailed(
-                        "Failed to open connection".to_string(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(1000));
-            }
-
-            // Get all services
-            let mut services: id = msg_send![self.device, services];
-            if services == nil {
-                debug!("No services found, trying SDP query again...");
-                let _: bool = msg_send![self.device, performSDPQuery:nil];
-                thread::sleep(Duration::from_millis(1000));
-                services = msg_send![self.device, services];
-            }
-
-            if services == nil {
-                let _: () = msg_send![pool, release];
-                return Err(BluetoothError::ConnectionFailed(
-                    "No services available".to_string(),
-                ));
-            }
-
-            let count: usize = msg_send![services, count];
-            debug!("Found {} services", count);
-
-            // Inspect each service
-            for i in 0..count {
-                let service: id = msg_send![services, objectAtIndex:i];
-                if service != nil {
-                    // Try to get service UUID
-                    let uuid: id = msg_send![service, getServiceUUID];
-                    if uuid != nil {
-                        let uuid_str: id = msg_send![uuid, UUIDString];
-                        debug!("Service {}: UUID = {:?}", i, uuid_str);
-                    }
-
-                    // Try to get RFCOMM channel
-                    let mut channel_id: u8 = 0;
-                    let has_channel: bool = msg_send![service, getRFCOMMChannelID:&mut channel_id];
-                    if has_channel {
-                        debug!("Service {} has RFCOMM channel: {}", i, channel_id);
-
-                        // Try to open this channel
-                        let mut rfcomm_channel: id = nil;
-                        debug!("Attempting to open channel {}...", channel_id);
-                        let result: bool = msg_send![self.device,
-                                                   openRFCOMMChannelSync:&mut rfcomm_channel
-                                                   withChannelID:channel_id
-                                                   delegate:nil];
-
-                        if result && rfcomm_channel != nil {
-                            debug!("Successfully opened channel {}", channel_id);
-                            self.channel = rfcomm_channel;
-                            let _: () = msg_send![pool, release];
-                            return Ok(());
-                        } else {
-                            debug!("Failed to open channel {}", channel_id);
-                        }
-                    }
-                }
-            }
-
-            let _: () = msg_send![pool, release];
-            Err(BluetoothError::ConnectionFailed(
-                "Could not find usable RFCOMM channel".to_string(),
-            ))
+        if !which_output.status.success() {
+            return Err(BluetoothError::InternalError(
+                "blueutil not found. Install it with 'brew install blueutil'".to_string(),
+            ));
         }
+
+        debug!("Found blueutil");
+
+        // Make sure Bluetooth is on
+        let power_output = Command::new("blueutil")
+            .arg("--power")
+            .output()
+            .map_err(|e| {
+                BluetoothError::InternalError(format!("Failed to check Bluetooth power: {}", e))
+            })?;
+
+        if power_output.stdout[0] != b'1' {
+            debug!("Bluetooth is off, turning it on...");
+            Command::new("blueutil")
+                .args(["--power", "1"])
+                .output()
+                .map_err(|e| {
+                    BluetoothError::InternalError(format!("Failed to turn on Bluetooth: {}", e))
+                })?;
+
+            // Wait for Bluetooth to initialize
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        // Format the address
+        let addr = addr.replace("-", ":").to_uppercase();
+        debug!("Using address: {}", addr);
+        self.device_addr = addr.clone();
+
+        // Check if device is paired
+        let paired_output = Command::new("blueutil")
+            .args(["--paired"])
+            .output()
+            .map_err(|e| {
+                BluetoothError::InternalError(format!("Failed to check paired devices: {}", e))
+            })?;
+
+        let paired_str = String::from_utf8_lossy(&paired_output.stdout);
+        if !paired_str.contains(&addr) {
+            debug!("Device not paired, attempting to pair...");
+
+            // Start discovery
+            Command::new("blueutil")
+                .args(["--inquiry"])
+                .output()
+                .map_err(|e| {
+                    BluetoothError::InternalError(format!(
+                        "Failed to start device discovery: {}",
+                        e
+                    ))
+                })?;
+
+            // Wait for discovery
+            thread::sleep(Duration::from_secs(5));
+
+            // Try to pair
+            let pair_output = Command::new("blueutil")
+                .args(["--pair", &addr])
+                .output()
+                .map_err(|e| {
+                    BluetoothError::ConnectionFailed(format!("Failed to pair with device: {}", e))
+                })?;
+
+            if !pair_output.status.success() {
+                return Err(BluetoothError::ConnectionFailed(
+                    "Failed to pair with device".to_string(),
+                ));
+            }
+
+            debug!("Successfully paired with device");
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        // Connect to device
+        debug!("Connecting to device...");
+        let connect_output = Command::new("blueutil")
+            .args(["--connect", &addr])
+            .output()
+            .map_err(|e| {
+                BluetoothError::ConnectionFailed(format!("Failed to connect to device: {}", e))
+            })?;
+
+        if !connect_output.status.success() {
+            return Err(BluetoothError::ConnectionFailed(
+                "Failed to connect to device".to_string(),
+            ));
+        }
+
+        // Verify connection
+        thread::sleep(Duration::from_secs(1));
+        let info_output = Command::new("blueutil")
+            .args(["--info", &addr])
+            .output()
+            .map_err(|e| {
+                BluetoothError::InternalError(format!("Failed to get device info: {}", e))
+            })?;
+
+        let info_str = String::from_utf8_lossy(&info_output.stdout);
+        if !info_str.contains("connected: 1") {
+            return Err(BluetoothError::ConnectionFailed(
+                "Device connection verification failed".to_string(),
+            ));
+        }
+
+        debug!("Successfully connected to device");
+        Ok(())
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), BluetoothError> {
-        unsafe {
-            let pool: id = msg_send![class!(NSAutoreleasePool), new];
+        debug!("Writing {} bytes to device", data.len());
 
-            if self.channel == nil {
-                let _: () = msg_send![pool, release];
-                return Err(BluetoothError::NotConnected);
-            }
+        // Use hcitool to write the data
+        let mut child = Command::new("rfcomm")
+            .args(["send", &self.device_addr])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| BluetoothError::WriteError(format!("Failed to start rfcomm: {}", e)))?;
 
-            debug!("Writing {} bytes to device", data.len());
+        // Write data to stdin
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BluetoothError::WriteError("Failed to open rfcomm stdin".to_string()))?;
 
-            // Use small chunks to avoid buffer issues
-            const CHUNK_SIZE: usize = 64;
-            for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
-                debug!("Writing chunk {} ({} bytes)", i + 1, chunk.len());
-                let result: bool = msg_send![self.channel,
-                                           writeSync:chunk
-                                           length:chunk.len()];
+        stdin
+            .write_all(data)
+            .map_err(|e| BluetoothError::WriteError(format!("Failed to write data: {}", e)))?;
 
-                if !result {
-                    let _: () = msg_send![pool, release];
-                    return Err(BluetoothError::WriteError(format!(
-                        "Failed to write chunk {} to device",
-                        i + 1
-                    )));
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+        drop(stdin); // Close stdin so rfcomm knows we're done
 
-            let _: () = msg_send![pool, release];
-            debug!("Successfully wrote all data");
-            Ok(())
+        // Wait for process to complete
+        let status = child
+            .wait()
+            .map_err(|e| BluetoothError::WriteError(format!("Failed to complete write: {}", e)))?;
+
+        if !status.success() {
+            return Err(BluetoothError::WriteError(
+                "Failed to write data to device".to_string(),
+            ));
         }
+
+        debug!("Successfully wrote data to device");
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), BluetoothError> {
@@ -189,27 +182,22 @@ impl BluetoothSocket for MacOSBluetoothSocket {
 impl MacOSBluetoothSocket {
     pub fn new() -> Result<Self, BluetoothError> {
         Ok(MacOSBluetoothSocket {
-            device: nil,
-            channel: nil,
+            device_addr: String::new(),
         })
     }
 }
 
 impl Drop for MacOSBluetoothSocket {
     fn drop(&mut self) {
-        unsafe {
-            if self.channel != nil {
-                let pool: id = msg_send![class!(NSAutoreleasePool), new];
-
-                debug!("Closing RFCOMM channel");
-                let _: () = msg_send![self.channel, closeChannel];
-
-                if self.device != nil {
-                    debug!("Closing connection to device");
-                    let _: () = msg_send![self.device, closeConnection];
+        if !self.device_addr.is_empty() {
+            debug!("Disconnecting from device");
+            if let Ok(output) = Command::new("blueutil")
+                .args(["--disconnect", &self.device_addr])
+                .output()
+            {
+                if output.status.success() {
+                    debug!("Successfully disconnected from device");
                 }
-
-                let _: () = msg_send![pool, release];
             }
         }
     }

@@ -14,6 +14,11 @@ use super::BluetoothSocket;
 #[link(name = "IOBluetooth", kind = "framework")]
 extern "C" {}
 
+// UUID for Serial Port Profile
+const SPP_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
+// UUID for Serial Port Profile Service Class
+const SPP_SERVICE_CLASS_UUID: &str = "00001101-0000-1000-8000-00805F9B34FB";
+
 pub struct MacOSBluetoothSocket {
     device: id,
     channel: id,
@@ -34,123 +39,96 @@ impl BluetoothSocket for MacOSBluetoothSocket {
                 None => {
                     let _: () = msg_send![pool, release];
                     return Err(BluetoothError::InternalError(
-                        "IOBluetooth framework not found. Make sure Bluetooth is enabled."
-                            .to_string(),
+                        "IOBluetooth framework not found".to_string(),
                     ));
                 }
             };
 
-            // First try to get paired device
+            // Get the device
             self.device = msg_send![device_class, withAddressString:addr_str];
             if self.device == nil {
                 let _: () = msg_send![pool, release];
                 return Err(BluetoothError::ConnectionFailed(
-                    "Device not found. Make sure it's paired in System Settings.".to_string(),
+                    "Device not found".to_string(),
                 ));
             }
 
-            // Force an SDP query first
-            debug!("Performing SDP query...");
+            // Force fresh service discovery
+            debug!("Performing service discovery...");
             let _: bool = msg_send![self.device, performSDPQuery:nil];
             thread::sleep(Duration::from_millis(1000));
 
-            // Check if already connected
+            // Connect if not already connected
             let is_connected: bool = msg_send![self.device, isConnected];
             if !is_connected {
                 debug!("Device not connected, attempting to connect...");
-
-                // Try to connect multiple times
-                for attempt in 1..=3 {
-                    debug!("Connection attempt {} of 3", attempt);
-                    let connect_result: bool = msg_send![self.device, openConnection];
-                    if connect_result {
-                        // Wait for connection to establish
-                        for i in 0..10 {
-                            let is_connected: bool = msg_send![self.device, isConnected];
-                            if is_connected {
-                                debug!("Connection established after {} checks", i + 1);
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(500));
-                        }
-
-                        let is_connected: bool = msg_send![self.device, isConnected];
-                        if is_connected {
-                            break;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(1000));
-                }
-
-                let is_connected: bool = msg_send![self.device, isConnected];
-                if !is_connected {
+                let connect_result: bool = msg_send![self.device, openConnection];
+                if !connect_result {
                     let _: () = msg_send![pool, release];
                     return Err(BluetoothError::ConnectionFailed(
-                        "Failed to establish connection after multiple attempts".to_string(),
+                        "Failed to open connection".to_string(),
                     ));
                 }
-            }
-
-            debug!("Device connected, discovering services...");
-
-            // Look for Serial Port Profile service
-            let mut services: id = msg_send![self.device, services];
-            if services == nil {
-                debug!("No services found, performing another SDP query...");
-                let _: bool = msg_send![self.device, performSDPQuery:nil];
                 thread::sleep(Duration::from_millis(1000));
-                services = msg_send![self.device, services];
             }
 
-            if services == nil {
+            // Get services
+            debug!("Looking for Serial Port Profile service...");
+
+            // Get the CBUUID class and create UUID object
+            let uuid_class = match Class::get("CBUUID") {
+                Some(class) => class,
+                None => {
+                    let _: () = msg_send![pool, release];
+                    return Err(BluetoothError::InternalError(
+                        "CBUUID class not found".to_string(),
+                    ));
+                }
+            };
+
+            let spp_uuid = NSString::alloc(nil).init_str(SPP_UUID);
+            let uuid_obj: id = msg_send![uuid_class, UUIDWithString:spp_uuid];
+
+            // Get service with SPP UUID
+            let service: id = msg_send![self.device, getServiceRecordForUUID:uuid_obj];
+            if service == nil {
                 let _: () = msg_send![pool, release];
                 return Err(BluetoothError::ConnectionFailed(
-                    "No services found on device".to_string(),
+                    "Serial Port Profile service not found".to_string(),
                 ));
             }
 
-            let count: usize = msg_send![services, count];
-            debug!("Found {} services", count);
-
-            // Try channels in order of probability for this device
-            let channel_ids = [4u8, 1u8, 2u8, 3u8]; // Starting with 4 as it's common for printers
-            let mut success = false;
-
-            for &channel_id in &channel_ids {
-                debug!("Trying RFCOMM channel {}", channel_id);
-                let mut rfcomm_channel: id = nil;
-
-                // Attempt to open channel multiple times
-                for attempt in 1..=3 {
-                    debug!("Channel {} attempt {} of 3", channel_id, attempt);
-                    let result: bool = msg_send![self.device,
-                                               openRFCOMMChannelSync:&mut rfcomm_channel
-                                               withChannelID:channel_id
-                                               delegate:nil];
-
-                    if result && rfcomm_channel != nil {
-                        self.channel = rfcomm_channel;
-                        success = true;
-                        debug!("Successfully opened RFCOMM channel {}", channel_id);
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
-
-                if success {
-                    break;
-                }
-            }
-
-            if !success {
+            // Get RFCOMM channel from service
+            let mut channel_id: u8 = 0;
+            let result: bool = msg_send![service, getRFCOMMChannelID:&mut channel_id];
+            if !result {
                 let _: () = msg_send![pool, release];
                 return Err(BluetoothError::ConnectionFailed(
-                    "Failed to open RFCOMM channel after multiple attempts".to_string(),
+                    "Could not get RFCOMM channel ID".to_string(),
                 ));
             }
+
+            debug!("Found RFCOMM channel ID: {}", channel_id);
+
+            // Open the RFCOMM channel
+            let mut rfcomm_channel: id = nil;
+            let result: bool = msg_send![self.device,
+                                       openRFCOMMChannelSync:&mut rfcomm_channel
+                                       withChannelID:channel_id
+                                       delegate:nil];
+
+            if !result || rfcomm_channel == nil {
+                let _: () = msg_send![pool, release];
+                return Err(BluetoothError::ConnectionFailed(format!(
+                    "Failed to open RFCOMM channel {}",
+                    channel_id
+                )));
+            }
+
+            self.channel = rfcomm_channel;
 
             let _: () = msg_send![pool, release];
-            debug!("Successfully connected to device");
+            debug!("Successfully connected to device on channel {}", channel_id);
             Ok(())
         }
     }
@@ -166,13 +144,9 @@ impl BluetoothSocket for MacOSBluetoothSocket {
 
             debug!("Writing {} bytes to device", data.len());
 
-            // Try to get MTU, default to 128 if not available
-            let mtu: u16 = msg_send![self.channel, getMTU];
-            let chunk_size = if mtu > 0 { mtu as usize } else { 128 };
-            debug!("Using chunk size of {} bytes", chunk_size);
-
-            // Write data in chunks
-            for (i, chunk) in data.chunks(chunk_size).enumerate() {
+            // Use small chunks to avoid buffer issues
+            const CHUNK_SIZE: usize = 64;
+            for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
                 debug!("Writing chunk {} ({} bytes)", i + 1, chunk.len());
                 let result: bool = msg_send![self.channel,
                                            writeSync:chunk

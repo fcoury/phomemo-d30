@@ -10,7 +10,6 @@ keywords.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bluetooth-serial-port-async.workspace = true
 derive_more.workspace = true
 dimensions.workspace = true
 image.workspace = true

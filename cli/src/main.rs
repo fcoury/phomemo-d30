@@ -12,8 +12,8 @@ use std::{
 };
 
 use advmac::{MacAddr6, ParseError};
-use bluetooth_serial_port_async::{BtAddr, BtError};
 use clap::{Parser, Subcommand};
+use d30::bluetooth::{self, BluetoothSocket};
 use d30::D30Scale;
 use image::{DynamicImage, ImageError, ImageFormat};
 use inquire::InquireError;
@@ -294,11 +294,18 @@ fn get_addr(config: &mut Config, user_maybe_addr: Option<String>) -> Result<MacA
 enum CLIError {
     #[snafu(display("D30 library error"))]
     D30LibError { source: d30::D30Error },
+
     #[snafu(display("Failed to prompt user in interactive mode"))]
     FailedToPromptUser { source: InquireError },
 
+    #[snafu(display("Error while attempting bluetooth operation: {source}"))]
+    BluetoothError { source: bluetooth::BluetoothError },
+
     #[snafu(display("Error while attempting task `{task}` in bluetooth backend: {source}"))]
-    BluetoothBackend { source: BtError, task: String },
+    BluetoothBackend {
+        source: bluetooth::BluetoothError,
+        task: String,
+    },
 
     #[snafu(display("IO error while attempting to execute task: {task}"))]
     IOError {
@@ -311,10 +318,13 @@ enum CLIError {
 
     #[snafu(display("Could not get XDG path"))]
     CouldNotGetXDGPath { source: xdg::BaseDirectoriesError },
+
     #[snafu(display("Could not place config file"))]
     CouldNotPlaceConfigFile { source: io::Error },
+
     #[snafu(display("Failed to read in automatically detected D30 CLI configuration path"))]
     CouldNotReadFile { source: io::Error },
+
     #[snafu(display("Failed to serialize TOML D30 config"))]
     CouldNotParseTOML { source: toml::de::Error },
 
@@ -340,10 +350,12 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
     let dry_run = config.dry_run.unwrap_or(false) || args.dry_run;
     let show_preview = config.enable_preview.unwrap_or(false) || args.preview;
     let addr = get_addr(config, args.device.clone())?;
+
     debug!(
         "Generating image {} with scale {:?}",
         &args.text, &args.scale
     );
+
     let args_text = unescape::unescape(&args.text).expect("Failed to unescape input");
     if args.minus_scale != 0.0 {
         match &mut args.scale {
@@ -355,9 +367,11 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             }
         }
     }
+
     let image = d30::generate_image(&args_text, args.margins, args.scale).context(D30LibSnafu)?;
     let mut preview_image = image.rotate90();
     preview_image.invert();
+
     if show_preview {
         let should_accept = match cmd_show_preview(config.preview.clone(), preview_image)? {
             Accepted::Yes => true,
@@ -373,18 +387,17 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             return Ok(());
         }
     }
+
+    // Create platform-specific socket
     let mut socket =
-        bluetooth_serial_port_async::BtSocket::new(bluetooth_serial_port_async::BtProtocol::RFCOMM)
-            .context(BluetoothBackendSnafu {
-                task: "opening socket".to_string(),
-            })?;
+        bluetooth::create_socket().map_err(|e| CLIError::BluetoothError { source: e })?;
 
     let mut connected = false;
     println!("Connecting...");
     if !dry_run {
         for _ in 0..args.max_retries {
             info!("Connection address: {}", addr);
-            match socket.connect(BtAddr(addr.to_array())) {
+            match socket.connect(&addr.to_string()) {
                 Ok(_) => {
                     connected = true;
                     break;
@@ -396,16 +409,19 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             }
         }
     }
-    if !connected {
+
+    if !connected && !dry_run {
         error!("Failed to connect after {} retries!", args.max_retries);
         exit(1);
     }
+
     debug!("Init connection");
     if !dry_run {
-        socket.write(d30::INIT_BASE_FLAT).context(IOSnafu {
-            task: "send magic init bytes".to_string(),
-        })?;
+        socket
+            .write(d30::INIT_BASE_FLAT)
+            .map_err(|e| CLIError::BluetoothError { source: e })?;
     }
+
     debug!("Extend output");
 
     // Image must be send in chunks of 255 lines
@@ -421,19 +437,20 @@ fn cmd_print(config: &mut Config, args: &ArgsPrintText) -> Result<(), CLIError> 
             }
             debug!("Write output to socket");
             if !dry_run {
-                socket.write(output.as_slice()).context(IOSnafu {
-                    task: format!("write image #{}", image_num),
-                })?;
+                socket
+                    .write(output.as_slice())
+                    .map_err(|e| CLIError::BluetoothError { source: e })?;
             }
             debug!("Flush socket");
             if !dry_run {
-                socket.flush().context(IOSnafu {
-                    task: "flush socket".to_string(),
-                })?;
+                socket
+                    .flush()
+                    .map_err(|e| CLIError::BluetoothError { source: e })?;
             }
             output.clear();
         }
     }
+
     Ok(())
 }
 

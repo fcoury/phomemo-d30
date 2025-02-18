@@ -1,3 +1,5 @@
+pub mod bluetooth;
+
 use std::io;
 use std::{fs, path::PathBuf, str::FromStr};
 

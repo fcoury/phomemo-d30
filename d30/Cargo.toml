@@ -9,7 +9,6 @@ keywords.workspace = true
 
 [dependencies]
 dimensions.workspace = true
-bluetooth-serial-port-async.workspace = true
 derive_more.workspace = true
 image.workspace = true
 imageproc.workspace = true
@@ -24,3 +23,15 @@ indexmap.workspace = true
 advmac.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluetooth-serial-port-async = "0.6.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa-foundation = "0.1"
+core-foundation = "0.9.3"
+core-foundation-sys = "0.8.4"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.0"
